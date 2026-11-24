@@ -1,0 +1,22 @@
+# Universal hardened configuration for mac-campus-vpn (zju-connect)
+# Credentials (username & password) are NOT stored here;
+# they are stored encrypted in macOS Keychain and injected at runtime by campus-vpn.
+
+protocol = "easyconnect"
+server_address = "vpn.example.edu.cn"
+server_port = 443
+
+# Strict TLS certificate verification is enabled by default.
+# Only set to true if your campus VPN gateway uses a self-signed certificate.
+insecure_skip_verify = false
+
+# Bind SOCKS5 strictly to loopback; disable unused HTTP/DNS/TUN listeners.
+socks_bind = "127.0.0.1:11080"
+http_bind = ""
+dns_server_bind = ""
+tun_mode = false
+dns_hijack = false
+
+# Generic non-ZJU defaults
+disable_zju_config = true
+disable_multi_line = true

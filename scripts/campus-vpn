@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEYCHAIN_SERVICE="mac-campus-vpn"
+CONFIG_DIR="$HOME/.config/campus-vpn"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
+BIN_FILE="$HOME/.local/bin/zju-connect"
+STATE_DIR="$HOME/.local/state/campus-vpn"
+PID_FILE="$STATE_DIR/campus-vpn.pid"
+LOG_FILE="$STATE_DIR/campus-vpn.log"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  campus-vpn [start]  Start campus VPN in background (safe to close Terminal)
+  campus-vpn stop     Stop background VPN & wipe session logs (SSH auto-switches to direct)
+  campus-vpn status   Check whether VPN is running
+  campus-vpn logs     Show recent VPN logs
+  campus-vpn fg       Run VPN in foreground (for interactive 2FA/captcha or debugging)
+  campus-vpn setup    Configure VPN gateway & store credentials securely in macOS Keychain
+  campus-vpn remove   Remove stored credentials from macOS Keychain
+EOF
+}
+
+get_socks_host_port() {
+  local bind="127.0.0.1:11080"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local parsed
+    parsed="$(awk -F'"' '/^[[:space:]]*socks_bind[[:space:]]*=/ {print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [[ -n "$parsed" ]]; then
+      bind="$parsed"
+    fi
+  fi
+  SOCKS_HOST="${bind%:*}"
+  SOCKS_PORT="${bind##*:}"
+  if [[ -z "$SOCKS_HOST" ]]; then
+    SOCKS_HOST="127.0.0.1"
+  fi
+}
+
+is_listening() {
+  get_socks_host_port
+  /usr/bin/nc -z "$SOCKS_HOST" "$SOCKS_PORT" >/dev/null 2>&1
+}
+
+find_running_pid() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  pgrep -u "$USER" -f "$BIN_FILE -config $CONFIG_FILE" 2>/dev/null | head -n 1 || true
+}
+
+load_credentials() {
+  if [[ ! -x "$BIN_FILE" ]]; then
+    echo "未找到可执行文件: ${BIN_FILE}（请先运行 ./install.sh）" >&2
+    exit 1
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "未找到配置文件: ${CONFIG_FILE}（请先运行 campus-vpn setup）" >&2
+    exit 1
+  fi
+
+  VPN_USER="$(security find-generic-password -s "$KEYCHAIN_SERVICE" 2>/dev/null | awk -F'"' '/"acct"<blob>=/ {print $4; exit}')"
+  VPN_PASS="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)"
+
+  if [[ -z "$VPN_USER" || -z "$VPN_PASS" ]]; then
+    echo "尚未配置凭据，请先运行: campus-vpn setup" >&2
+    exit 1
+  fi
+}
+
+normalize_server_host() {
+  local raw="$1"
+  raw="${raw#https://}"
+  raw="${raw#http://}"
+  raw="${raw%%/*}"
+  raw="${raw%%:*}"
+  printf '%s' "$raw"
+}
+
+cmd="${1:-start}"
+
+case "$cmd" in
+  setup)
+    printf "请输入学校 VPN 网关地址（例如 vpn.example.edu.cn，支持直接粘贴 https:// 链接）: "
+    IFS= read -r raw_server
+    vpn_server="$(normalize_server_host "$raw_server")"
+    if [[ -z "$vpn_server" ]]; then
+      echo "VPN 网关地址不能为空。" >&2
+      exit 1
+    fi
+
+    printf "请输入 VPN 端口 [默认 443]: "
+    IFS= read -r vpn_port
+    vpn_port="${vpn_port:-443}"
+    if ! [[ "$vpn_port" =~ ^[0-9]+$ ]] || (( vpn_port < 1 || vpn_port > 65535 )); then
+      echo "端口号无效: ${vpn_port}" >&2
+      exit 1
+    fi
+
+    printf "请选择协议 (easyconnect / atrust) [默认 easyconnect]: "
+    IFS= read -r vpn_proto
+    vpn_proto="${vpn_proto:-easyconnect}"
+    if [[ "$vpn_proto" != "easyconnect" && "$vpn_proto" != "atrust" ]]; then
+      echo "不支持的协议: ${vpn_proto}" >&2
+      exit 1
+    fi
+
+    printf "是否需要跳过自签名证书校验？(仅学校使用自签名证书时选 y) [y/N]: "
+    IFS= read -r skip_tls
+    insecure_flag="false"
+    if [[ "$skip_tls" == "y" || "$skip_tls" == "Y" ]]; then
+      insecure_flag="true"
+    fi
+
+    printf "请输入校园网 VPN 用户名: "
+    IFS= read -r vpn_user
+    if [[ -z "$vpn_user" ]]; then
+      echo "用户名不能为空。" >&2
+      exit 1
+    fi
+
+    umask 077
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+# Managed by campus-vpn setup (credentials are stored in macOS Keychain, never here)
+protocol = "${vpn_proto}"
+server_address = "${vpn_server}"
+server_port = ${vpn_port}
+insecure_skip_verify = ${insecure_flag}
+
+socks_bind = "127.0.0.1:11080"
+http_bind = ""
+dns_server_bind = ""
+tun_mode = false
+dns_hijack = false
+
+disable_zju_config = true
+disable_multi_line = true
+EOF
+    chmod 600 "$CONFIG_FILE"
+
+    security delete-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+    echo "接下来请在提示中输入 VPN 密码（输入时不会回显，直接加密存入 macOS 钥匙串）："
+    security add-generic-password -U -s "$KEYCHAIN_SERVICE" -a "$vpn_user" -w
+
+    echo "配置已保存至 ${CONFIG_FILE}，凭据已加密存入 macOS 钥匙串（服务名: ${KEYCHAIN_SERVICE}，账号: ${vpn_user}）。"
+    echo "现在直接运行 campus-vpn 即可后台连接。"
+    ;;
+
+  status)
+    get_socks_host_port
+    pid="$(find_running_pid)"
+    if is_listening; then
+      if [[ -n "$pid" ]]; then
+        echo "campus-vpn 正在运行（PID: ${pid}，${SOCKS_HOST}:${SOCKS_PORT} 已监听，校内 SSH 将自动走 VPN）"
+      else
+        echo "campus-vpn 正在运行（${SOCKS_HOST}:${SOCKS_PORT} 已监听，校内 SSH 将自动走 VPN）"
+      fi
+    else
+      echo "campus-vpn 未运行（${SOCKS_HOST}:${SOCKS_PORT} 未监听，校内 SSH 将自动直连）"
+    fi
+    ;;
+
+  logs)
+    if [[ -f "$LOG_FILE" ]]; then
+      tail -n 50 "$LOG_FILE"
+    else
+      echo "暂无后台日志文件: ${LOG_FILE}"
+    fi
+    ;;
+
+  stop)
+    pid="$(find_running_pid)"
+    if [[ -z "$pid" ]]; then
+      : > "$LOG_FILE" 2>/dev/null || true
+      echo "campus-vpn 当前未运行。"
+      exit 0
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    : > "$LOG_FILE" 2>/dev/null || rm -f "$LOG_FILE"
+    echo "campus-vpn 已停止并已清空会话日志（校内 SSH 现已恢复自动直连）。"
+    ;;
+
+  remove)
+    if security delete-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1; then
+      echo "已从 macOS 钥匙串删除 ${KEYCHAIN_SERVICE} 凭据。"
+    else
+      echo "钥匙串中未找到 ${KEYCHAIN_SERVICE} 凭据。"
+    fi
+    ;;
+
+  start)
+    get_socks_host_port
+    if is_listening; then
+      pid="$(find_running_pid)"
+      echo "campus-vpn 已在运行中（PID: ${pid:-未知}，${SOCKS_HOST}:${SOCKS_PORT} 已监听）。"
+      exit 0
+    fi
+
+    load_credentials
+
+    umask 077
+    mkdir -p "$STATE_DIR"
+    : > "$LOG_FILE"
+
+    nohup env \
+      -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+      ZJU_CONNECT_USERNAME="$VPN_USER" \
+      ZJU_CONNECT_PASSWORD="$VPN_PASS" \
+      "$BIN_FILE" -config "$CONFIG_FILE" </dev/null >>"$LOG_FILE" 2>&1 &
+    pid=$!
+    disown "$pid" 2>/dev/null || true
+    echo "$pid" > "$PID_FILE"
+
+    for _ in $(seq 1 40); do
+      if is_listening; then
+        echo "campus-vpn 已在后台启动成功（PID: ${pid}，监听 ${SOCKS_HOST}:${SOCKS_PORT}）。"
+        echo "现在可以放心关闭终端窗口；回到校内后运行 campus-vpn stop 即可自动恢复直连。"
+        exit 0
+      fi
+      if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        echo "campus-vpn 启动失败，最近日志：" >&2
+        tail -n 20 "$LOG_FILE" >&2
+        exit 1
+      fi
+      sleep 0.25
+    done
+
+    echo "等待 ${SOCKS_HOST}:${SOCKS_PORT} 监听超时，请运行 campus-vpn logs 查看详情。" >&2
+    exit 1
+    ;;
+
+  fg)
+    get_socks_host_port
+    if is_listening; then
+      echo "${SOCKS_HOST}:${SOCKS_PORT} 已被占用（campus-vpn 可能已在运行）。" >&2
+      exit 1
+    fi
+
+    load_credentials
+
+    exec env \
+      -u http_proxy -u https_proxy -u all_proxy -u no_proxy \
+      -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY \
+      ZJU_CONNECT_USERNAME="$VPN_USER" \
+      ZJU_CONNECT_PASSWORD="$VPN_PASS" \
+      "$BIN_FILE" -config "$CONFIG_FILE"
+    ;;
+
+  -h|--help|help)
+    usage
+    ;;
+
+  *)
+    echo "未知参数: ${cmd}" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
